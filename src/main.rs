@@ -11,7 +11,7 @@ use diesel::prelude::*;
 use diesel::pg::PgConnection;
 use dotenv::dotenv;
 
-use models::{User, NewUser, LoginUser, Post , NewPost};
+use models::{User, NewUser, LoginUser, Post , NewPost, Comment, NewComment};
 
 fn establish_connection() -> PgConnection {
     dotenv().ok();
@@ -33,6 +33,54 @@ struct PostForm {
 struct Submission {
     title: String,
     link: String,
+}
+
+#[derive(Deserialize)]
+struct CommentForm {
+    comment: String,
+}
+
+async fn comment(
+    data: web::Form<CommentForm>,
+    id: Identity,
+    web::Path(post_id): web::Path<i32>
+) -> impl Responder {
+
+    if let Some(id) = id.identity() {
+        use schema::posts::dsl::{posts};
+        use schema::users::dsl::{users, username};
+
+        let connection = establish_connection();
+
+        let post :Post = posts.find(post_id)
+            .get_result(&connection)
+            .expect("Failed to find post.");
+
+        let user :Result<User, diesel::result::Error> = users
+            .filter(username.eq(id))
+            .first(&connection);
+
+        match user {
+            Ok(u) => {
+                let parent_id = None;
+                let new_comment = NewComment::new(data.comment.clone(), post.id, u.id, parent_id);
+
+                use schema::comments;
+                diesel::insert_into(comments::table)
+                    .values(&new_comment)
+                    .get_result::<Comment>(&connection)
+                    .expect("Error saving comment.");
+
+                return HttpResponse::Ok().body("Commented.");
+            }
+            Err(e) => {
+                println!("{:?}", e);
+                return HttpResponse::Ok().body("User not found.");
+            }
+        }
+    }
+
+    HttpResponse::Unauthorized().body("Not logged in.")
 }
 
 async fn submission(tera: web::Data<Tera>, id: Identity) -> impl Responder {
@@ -156,6 +204,45 @@ async fn logout(id: Identity) -> impl Responder {
     HttpResponse::Ok().body("Logged out.")
 }
 
+async fn post_page(tera: web::Data<Tera>,
+    id: Identity,
+    web::Path(post_id): web::Path<i32>
+) -> impl Responder {
+
+    use schema::posts::dsl::{posts};
+    use schema::users::dsl::{users};
+
+    let connection = establish_connection();
+
+    let post :Post = posts.find(post_id)
+        .get_result(&connection)
+        .expect("Failed to find post.");
+
+    let user :User = users.find(post.author)
+        .get_result(&connection)
+        .expect("Failed to find user.");
+
+    let comments :Vec<(Comment, User)> = Comment::belonging_to(&post)
+        .inner_join(users)
+        .load(&connection)
+        .expect("Failed to find comments.");
+
+    let mut data = Context::new();
+    data.insert("title", &format!("{} - HackerClone", post.title));
+    data.insert("post", &post);
+    data.insert("user", &user);
+    data.insert("comments", &comments);
+
+    if let Some(_id) = id.identity() {
+        data.insert("logged_in", "true");
+    } else {
+        data.insert("logged_in", "false");
+    }
+
+    let rendered = tera.render("post.html", &data).unwrap();
+    HttpResponse::Ok().body(rendered)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()>{
     HttpServer::new(|| {
@@ -176,6 +263,11 @@ async fn main() -> std::io::Result<()>{
             .route("/logout", web::to(logout))
             .route("/submission", web::get().to(submission))
             .route("/submission", web::post().to(process_submission))
+            .service(
+                web::resource("/post/{post_id}")
+                    .route(web::get().to(post_page))
+                    .route(web::post().to(comment))
+            )
     })
     .bind("127.0.0.1:8000")?
     .run()
